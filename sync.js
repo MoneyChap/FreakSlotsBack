@@ -156,26 +156,35 @@ async function rebuildCategoriesIndex({ limitPerCategory = 80 } = {}) {
         new: byCreatedDesc.slice(0, limitPerCategory),
     };
 
-    // Write category items with rank
     for (const [categoryId, list] of Object.entries(buckets)) {
         const batch = firestore.batch();
-        const colRef = firestore
+
+        const itemsCol = firestore
             .collection("categories")
             .doc(categoryId)
+            .collection("runs")
+            .doc(runId)
             .collection("items");
 
-        // Clear previous items (simple approach)
-        const old = await colRef.get();
-        old.docs.forEach((doc) => batch.delete(doc.ref));
-
         list.forEach((g, idx) => {
-            const docRef = colRef.doc(String(g.id));
+            const docRef = itemsCol.doc(String(g.id));
             batch.set(docRef, {
                 gameId: String(g.id),
                 rank: idx + 1,
                 updatedAt: new Date().toISOString(),
             });
         });
+
+        // flip pointer on the category doc (same batch)
+        const catRef = firestore.collection("categories").doc(categoryId);
+        batch.set(
+            catRef,
+            {
+                activeRunId: runId,
+                updatedAt: new Date().toISOString(),
+            },
+            { merge: true }
+        );
 
         await batch.commit();
     }
@@ -237,6 +246,8 @@ export async function runSync() {
     }
 
     await rebuildCategoriesIndex({ limitPerCategory: 80 });
+    const runId = String(Date.now());
+
 
     const today = toDateStringYYYYMMDD(new Date());
     await setLastSyncDate(today);
