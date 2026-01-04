@@ -5,6 +5,7 @@ import { CATEGORY_DEFS } from "./categories.js";
 const PER_PAGE = 150;
 // const FULL_SYNC = String(process.env.FULL_SYNC || "").toLowerCase() === "true";
 // const FULL_SYNC_LIMIT = Number(process.env.FULL_SYNC_LIMIT || 100);
+const MAX_SYNC_PAGES = Number(process.env.MAX_SYNC_PAGES || 1);
 
 
 function toDateStringYYYYMMDD(d) {
@@ -228,6 +229,7 @@ export async function runSync() {
         }
 
         page += 1;
+        if (page > MAX_SYNC_PAGES) break;
 
         // extra safety limit (keep it, but make it generous)
         if (page > 2000) break;
