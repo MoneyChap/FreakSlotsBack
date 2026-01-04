@@ -3,7 +3,9 @@ import { fetchGamesPage, buildEmbedUrl } from "./slotslaunch.js";
 import { CATEGORY_DEFS } from "./categories.js";
 
 const PER_PAGE = 150;
-const FULL_SYNC = String(process.env.FULL_SYNC || "").toLowerCase() === "true";
+// const FULL_SYNC = String(process.env.FULL_SYNC || "").toLowerCase() === "true";
+// const FULL_SYNC_LIMIT = Number(process.env.FULL_SYNC_LIMIT || 100);
+
 
 function toDateStringYYYYMMDD(d) {
     const yyyy = d.getUTCFullYear();
@@ -208,8 +210,15 @@ export async function runSync() {
         const publishedOnly = normalized.filter((g) => g.published === true);
         await upsertGames(publishedOnly);
 
-        totalFetched += normalized.length;
-        lastSeenUpdatedAt = normalized[normalized.length - 1]?.updatedAt || lastSeenUpdatedAt;
+        totalFetched += publishedOnly.length;
+
+        if (publishedOnly.length > 0) {
+            lastSeenUpdatedAt =
+                publishedOnly[publishedOnly.length - 1]?.updatedAt || lastSeenUpdatedAt;
+        } else {
+            lastSeenUpdatedAt =
+                normalized[normalized.length - 1]?.updatedAt || lastSeenUpdatedAt;
+        }
 
         // Stop condition based on meta, fallback to length-based
         if (lastPage !== null) {
