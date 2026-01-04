@@ -52,21 +52,19 @@ function normalizeGame(g) {
 
 async function upsertGames(games) {
     const firestore = db();
-    const batch = firestore.batch();
 
-    for (const g of games) {
-        const docRef = firestore.collection("games").doc(String(g.id));
-        batch.set(
-            docRef,
-            {
-                ...g,
-                syncedAt: new Date().toISOString(),
-            },
-            { merge: true }
-        );
+    const chunkSize = 250;
+    for (let i = 0; i < games.length; i += chunkSize) {
+        const batch = firestore.batch();
+        const chunk = games.slice(i, i + chunkSize);
+
+        for (const g of chunk) {
+            const docRef = firestore.collection("games").doc(String(g.id));
+            batch.set(docRef, { ...g, syncedAt: new Date().toISOString() }, { merge: true });
+        }
+
+        await batch.commit();
     }
-
-    await batch.commit();
 }
 
 async function getLastSyncDate() {
@@ -114,7 +112,7 @@ function pickCategoryIdsForGame(game) {
     return ids;
 }
 
-async function rebuildCategoriesIndex({ limitPerCategory = 40 } = {}) {
+async function rebuildCategoriesIndex({ limitPerCategory = 80 } = {}) {
     const firestore = db();
 
     // ensure category docs exist
@@ -207,7 +205,8 @@ export async function runSync() {
         }
 
         const normalized = rawGames.map(normalizeGame);
-        await upsertGames(normalized);
+        const publishedOnly = normalized.filter((g) => g.published === true);
+        await upsertGames(publishedOnly);
 
         totalFetched += normalized.length;
         lastSeenUpdatedAt = normalized[normalized.length - 1]?.updatedAt || lastSeenUpdatedAt;
@@ -225,7 +224,7 @@ export async function runSync() {
         if (page > 2000) break;
     }
 
-    await rebuildCategoriesIndex({ limitPerCategory: 40 });
+    await rebuildCategoriesIndex({ limitPerCategory: 80 });
 
     const today = toDateStringYYYYMMDD(new Date());
     await setLastSyncDate(today);

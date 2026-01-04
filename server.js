@@ -36,7 +36,7 @@ app.get("/api/home", async (req, res) => {
                 .doc(c.id)
                 .collection("items")
                 .orderBy("rank", "asc")
-                .limit(20)
+                .limit(50)
                 .get();
 
             const gameIds = itemsSnap.docs.map((d) => d.id);
