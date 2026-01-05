@@ -18,7 +18,7 @@ export async function fetchGamesPage({ page, perPage, updatedAt }) {
     url.searchParams.set("per_page", String(perPage));
     url.searchParams.set("published", 1);
     url.searchParams.set("order_by", "updated_at");
-    url.searchParams.set("order", "asc");
+    url.searchParams.set("order", "desc");
 
     if (updatedAt) {
         // format: yyyy-mm-dd

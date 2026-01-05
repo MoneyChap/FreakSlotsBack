@@ -16,8 +16,6 @@ function toDateStringYYYYMMDD(d) {
 }
 
 function normalizeGame(g) {
-    // g fields depend on SlotsLaunch response.
-    // Store only what frontend needs now; expand later.
     const id = String(g.id);
     const name = g.name || g.title || "";
     const provider =
@@ -28,13 +26,11 @@ function normalizeGame(g) {
     const rtp = typeof g.rtp === "number" ? g.rtp : g.rtp ? Number(g.rtp) : null;
     const updatedAt = g.updated_at || null;
     const createdAt = g.created_at || null;
+
     const publishedRaw = g.published;
     const published =
-        publishedRaw === true ||
-        publishedRaw === 1 ||
-        publishedRaw === "1";
+        publishedRaw === true || publishedRaw === 1 || publishedRaw === "1";
 
-    // SlotsLaunch provides iframe URL in g.url (typically https://slotslaunch.com/iframe/{id})
     const apiUrl = g.url || "";
     const embedUrl = apiUrl ? buildEmbedUrl(apiUrl) : "";
 
@@ -55,15 +51,19 @@ function normalizeGame(g) {
 
 async function upsertGames(games) {
     const firestore = db();
-
     const chunkSize = 250;
+
     for (let i = 0; i < games.length; i += chunkSize) {
         const batch = firestore.batch();
         const chunk = games.slice(i, i + chunkSize);
 
         for (const g of chunk) {
             const docRef = firestore.collection("games").doc(String(g.id));
-            batch.set(docRef, { ...g, syncedAt: new Date().toISOString() }, { merge: true });
+            batch.set(
+                docRef,
+                { ...g, syncedAt: new Date().toISOString() },
+                { merge: true }
+            );
         }
 
         await batch.commit();
@@ -80,8 +80,7 @@ async function getLastSyncDate() {
 
 async function setLastSyncDate(dateStr) {
     const firestore = db();
-    const metaRef = firestore.collection("meta").doc("sync");
-    await metaRef.set(
+    await firestore.collection("meta").doc("sync").set(
         {
             lastUpdatedAtDate: dateStr,
             updatedAt: new Date().toISOString(),
@@ -116,6 +115,7 @@ function pickCategoryIdsForGame(game) {
 }
 
 async function rebuildCategoriesIndex({ limitPerCategory = 80 } = {}) {
+    if (!runId) throw new Error("rebuildCategoriesIndex: missing runId");
     const firestore = db();
 
     // ensure category docs exist
@@ -190,12 +190,46 @@ async function rebuildCategoriesIndex({ limitPerCategory = 80 } = {}) {
     }
 }
 
+// Fetch newest published games and store exactly N
+export async function seedNewestPublishedGames({ target = 100, maxPages = 10 } = {}) {
+    let page = 1;
+    const collected = [];
+
+    while (collected.length < target && page <= maxPages) {
+        const data = await fetchGamesPage({
+            page,
+            perPage: PER_PAGE,
+            updatedAt: null,
+        });
+
+        const rawGames = Array.isArray(data) ? data : (data.data || data.games || []);
+        if (!rawGames.length) break;
+
+        // fetchGamesPage already requests published=1, but keep a safety filter
+        const normalized = rawGames.map(normalizeGame).filter((g) => g.published === true);
+
+        for (const g of normalized) {
+            collected.push(g);
+            if (collected.length >= target) break;
+        }
+
+        page += 1;
+    }
+
+    const finalList = collected.slice(0, target);
+    await upsertGames(finalList);
+    await setLastSyncDate(toDateStringYYYYMMDD(new Date()));
+
+    return { stored: finalList.length, pagesUsed: page - 1 };
+}
+
 export async function runSync() {
     const lastDate = await getLastSyncDate();
 
-    // One-time full sync switch (set FULL_SYNC=true in Render env vars)
     const FULL_SYNC = String(process.env.FULL_SYNC || "").toLowerCase() === "true";
     const updatedAt = FULL_SYNC ? null : (lastDate || null);
+
+    const runId = String(Date.now()); // define BEFORE rebuildCategoriesIndex
 
     let page = 1;
     let totalFetched = 0;
@@ -205,33 +239,25 @@ export async function runSync() {
     while (true) {
         const data = await fetchGamesPage({ page, perPage: PER_PAGE, updatedAt });
 
-        // SlotsLaunch returns { data: [...], meta: {...} }
         const rawGames = Array.isArray(data) ? data : (data.data || data.games || []);
         const meta = Array.isArray(data) ? null : (data.meta || null);
 
         if (!rawGames.length) break;
 
-        // Learn last_page from meta (first response is enough)
-        if (meta && typeof meta.last_page === "number") {
-            lastPage = meta.last_page;
-        }
+        if (meta && typeof meta.last_page === "number") lastPage = meta.last_page;
 
         const normalized = rawGames.map(normalizeGame);
         const publishedOnly = normalized.filter((g) => g.published === true);
+
         await upsertGames(publishedOnly);
-        break;
 
         totalFetched += publishedOnly.length;
 
-        if (publishedOnly.length > 0) {
-            lastSeenUpdatedAt =
-                publishedOnly[publishedOnly.length - 1]?.updatedAt || lastSeenUpdatedAt;
-        } else {
-            lastSeenUpdatedAt =
-                normalized[normalized.length - 1]?.updatedAt || lastSeenUpdatedAt;
-        }
+        // track last seen updatedAt
+        const tail = publishedOnly.length ? publishedOnly[publishedOnly.length - 1] : normalized[normalized.length - 1];
+        lastSeenUpdatedAt = tail?.updatedAt || lastSeenUpdatedAt;
 
-        // Stop condition based on meta, fallback to length-based
+        // stop condition
         if (lastPage !== null) {
             if (page >= lastPage) break;
         } else {
@@ -240,22 +266,17 @@ export async function runSync() {
 
         page += 1;
         if (page > MAX_SYNC_PAGES) break;
-
-        // extra safety limit (keep it, but make it generous)
         if (page > 2000) break;
     }
 
     const REBUILD_CATEGORIES = String(process.env.REBUILD_CATEGORIES || "false").toLowerCase() === "true";
     if (REBUILD_CATEGORIES) {
-        await rebuildCategoriesIndex({ limitPerCategory: 80 });
+        await rebuildCategoriesIndex({ limitPerCategory: 80, runId });
     }
-    
-    const runId = String(Date.now());
 
+    await setLastSyncDate(toDateStringYYYYMMDD(new Date()));
 
-    const today = toDateStringYYYYMMDD(new Date());
-    await setLastSyncDate(today);
-
-    return { totalFetched, updatedAtUsed: updatedAt, lastSeenUpdatedAt, lastPage };
+    return { totalFetched, updatedAtUsed: updatedAt, lastSeenUpdatedAt, lastPage, runId };
 }
+
 

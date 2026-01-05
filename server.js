@@ -4,6 +4,9 @@ import cors from "cors";
 import { db } from "./firebase.js";
 import { runSync } from "./sync.js";
 import { CATEGORY_DEFS } from "./categories.js";
+import { seedNewestPublishedGames } from "./sync.js";
+import { deleteCollection } from "./admin.js";
+
 
 const app = express();
 app.use(cors());
@@ -191,4 +194,27 @@ app.post("/api/sync", async (req, res) => {
 const port = Number(process.env.PORT || 3001);
 app.listen(port, () => {
     console.log(`API listening on :${port}`);
+});
+
+
+app.post("/api/admin/reset", async (req, res) => {
+    try {
+        if (!requireSecret(req)) {
+            res.status(401).json({ error: "Unauthorized" });
+            return;
+        }
+
+        const target = Number(req.body?.target ?? 100);
+
+        // wipe collections
+        await deleteCollection("games", 300);
+        // optional: if you still use categories collection from older code
+        // await deleteCollection("categories", 100);
+
+        const info = await seedNewestPublishedGames({ target });
+
+        res.json({ ok: true, info });
+    } catch (e) {
+        res.status(500).json({ error: String(e.message || e) });
+    }
 });
