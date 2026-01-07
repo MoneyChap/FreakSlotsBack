@@ -6,6 +6,7 @@ import { runSync } from "./sync.js";
 import { CATEGORY_DEFS } from "./categories.js";
 import { seedNewestPublishedGames } from "./sync.js";
 import { deleteCollection } from "./admin.js";
+import fetch from "node-fetch";
 
 
 const app = express();
@@ -247,6 +248,65 @@ app.post("/api/admin/reset", async (req, res) => {
         const info = await seedNewestPublishedGames({ target });
 
         res.json({ ok: true, info });
+    } catch (e) {
+        res.status(500).json({ error: String(e.message || e) });
+    }
+});
+
+app.post("/api/geo/reverse", async (req, res) => {
+    try {
+        const lat = Number(req.body?.lat);
+        const lon = Number(req.body?.lon);
+
+        if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+            res.status(400).json({ error: "Invalid lat/lon" });
+            return;
+        }
+
+        const url = new URL("https://nominatim.openstreetmap.org/reverse");
+        url.searchParams.set("format", "json");
+        url.searchParams.set("lat", String(lat));
+        url.searchParams.set("lon", String(lon));
+        url.searchParams.set("zoom", "10");
+        url.searchParams.set("addressdetails", "1");
+
+        const r = await fetch(url.toString(), {
+            headers: {
+                "User-Agent": "FreakSlots/1.0 (support@your-domain.example)",
+                "Accept": "application/json",
+            },
+        });
+
+        if (!r.ok) {
+            const txt = await r.text().catch(() => "");
+            res.status(502).json({ error: `Reverse geocode failed: ${r.status} ${txt.slice(0, 120)}` });
+            return;
+        }
+
+        const data = await r.json();
+
+        const a = data?.address || {};
+        const country = a.country || null;
+
+        const city =
+            a.city ||
+            a.town ||
+            a.village ||
+            a.municipality ||
+            a.county ||
+            null;
+
+        res.json({
+            ok: true,
+            lat,
+            lon,
+            city,
+            country,
+            label: city && country ? `${country} (${city})` : (country || city || "Unknown"),
+            raw: {
+                display_name: data?.display_name || null,
+            },
+        });
     } catch (e) {
         res.status(500).json({ error: String(e.message || e) });
     }
