@@ -24,6 +24,7 @@ app.use(express.json());
 const GEO_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24h
 const geoCache = new Map(); // ip -> { ts, data }
 
+
 function requireSecret(req) {
     const secret = req.headers["x-sync-secret"];
     return secret && secret === process.env.SYNC_SECRET;
@@ -78,8 +79,11 @@ async function fetchJson(url, headers = {}) {
 /* -----------------------------
    Simple in-memory API caches
 ------------------------------ */
-const HOME_CACHE_TTL_MS = 60 * 1000; // 60s
+const HOME_CACHE_TTL_MS = 10 * 60 * 1000; // 10 min
 let homeCache = null; // { ts, data }
+let homeInFlight = null; // Promise resolving to result array
+let homeCircuitUntil = 0; // if quota errors happen, skip Firestore until this time
+
 
 const GAME_CACHE_TTL_MS = 10 * 60 * 1000; // 10 min
 const gameCache = new Map(); // id -> { ts, data }
@@ -87,6 +91,19 @@ const gameCache = new Map(); // id -> { ts, data }
 function isQuotaError(e) {
     const msg = String(e?.message || e || "");
     return msg.includes("RESOURCE_EXHAUSTED") || msg.includes("Quota exceeded");
+}
+
+function withTimeout(promise, ms) {
+    return Promise.race([
+        promise,
+        new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), ms)),
+    ]);
+}
+
+function safeTs(v) {
+    if (typeof v === "number" && Number.isFinite(v)) return v;
+    const t = Date.parse(String(v || ""));
+    return Number.isFinite(t) ? t : 0;
 }
 
 function toClientGame(g) {
@@ -100,12 +117,6 @@ function toClientGame(g) {
     };
 }
 
-function safeTs(v) {
-    // supports ISO date, number, or null
-    if (typeof v === "number" && Number.isFinite(v)) return v;
-    const t = Date.parse(String(v || ""));
-    return Number.isFinite(t) ? t : 0;
-}
 
 /* -----------------------------
    Debug / health
@@ -193,88 +204,102 @@ app.get("/api/geo", async (req, res) => {
 ------------------------------ */
 app.get("/api/home", async (req, res) => {
     try {
-        // Fast path: serve cache
+        // 1) Serve cache if fresh
         if (homeCache && Date.now() - homeCache.ts < HOME_CACHE_TTL_MS) {
             res.json(homeCache.data);
             return;
         }
 
-        const firestore = db();
-
-        // One query only
-        // Fetch enough to build all categories in memory.
-        // Ordering by updatedAtTs is best (if you add it in sync.js). If it does not exist, updatedAt string still works.
-        let snap;
-        try {
-            snap = await firestore
-                .collection("games")
-                .where("enabled", "==", true)
-                .orderBy("updatedAtTs", "desc")
-                .limit(220)
-                .get();
-        } catch {
-            // Fallback if updatedAtTs index/field is not present yet
-            snap = await firestore
-                .collection("games")
-                .where("enabled", "==", true)
-                .orderBy("updatedAt", "desc")
-                .limit(220)
-                .get();
-        }
-
-        const docs = snap.docs.map((d) => d.data());
-
-        // Build categories in memory (no extra Firestore reads)
-        const byUpdated = [...docs].sort((a, b) => safeTs(b.updatedAtTs ?? b.updatedAt) - safeTs(a.updatedAtTs ?? a.updatedAt));
-        const byCreated = [...docs].sort((a, b) => safeTs(b.createdAtTs ?? b.createdAt) - safeTs(a.createdAtTs ?? a.createdAt));
-
-        const christmasKeywords = [
-            "christmas",
-            "xmas",
-            "santa",
-            "noel",
-            "holiday",
-            "winter",
-            "snow",
-            "new year",
-            "ny",
-            "jingle",
-        ];
-
-        const exclusive = docs.filter((g) => {
-            const name = String(g.name || "").toLowerCase();
-            return christmasKeywords.some((k) => name.includes(k));
-        });
-
-        const bestGames = byUpdated.slice(0, 50).map(toClientGame);
-        const newGames = byCreated.slice(0, 50).map(toClientGame);
-
-        const rtp97Games = docs
-            .filter((g) => typeof g.rtp === "number" && g.rtp >= 97)
-            .sort((a, b) => (b.rtp ?? 0) - (a.rtp ?? 0))
-            .slice(0, 50)
-            .map(toClientGame);
-
-        const exclusiveGames = (exclusive.length ? exclusive : byUpdated).slice(0, 50).map(toClientGame);
-
-        const result = [
-            { id: "exclusive", title: "Exclusive games", icon: "🎁", games: exclusiveGames },
-            { id: "best", title: "Best games", icon: "⭐", games: bestGames },
-            { id: "new", title: "New games", icon: "🆕", games: newGames },
-            { id: "rtp97", title: "RTP 97%", icon: "🎯", games: rtp97Games },
-        ];
-
-        homeCache = { ts: Date.now(), data: result };
-        res.json(result);
-    } catch (e) {
-        // If quota is hit, serve last cached response (even if stale) to keep app usable
-        if (isQuotaError(e) && homeCache?.data) {
-            res.json(homeCache.data);
+        // 2) If we recently hit quota, do NOT touch Firestore (fast path)
+        if (Date.now() < homeCircuitUntil) {
+            if (homeCache?.data) {
+                res.json(homeCache.data); // stale but usable
+            } else {
+                res.status(503).json({ error: "Temporarily unavailable" });
+            }
             return;
         }
-        res.status(500).json({ error: String(e.message || e) });
+
+        // 3) Coalesce multiple requests into one Firestore read
+        if (!homeInFlight) {
+            homeInFlight = (async () => {
+                const firestore = db();
+
+                // Only one query. Keep limit low.
+                // If you added updatedAtTs/createdAtTs later, it will use them for sorting in-memory.
+                const snap = await firestore
+                    .collection("games")
+                    .where("enabled", "==", true)
+                    .limit(220)
+                    .get();
+
+                const docs = snap.docs.map((d) => d.data());
+
+                const byUpdated = [...docs].sort(
+                    (a, b) => safeTs(b.updatedAtTs ?? b.updatedAt) - safeTs(a.updatedAtTs ?? a.updatedAt)
+                );
+                const byCreated = [...docs].sort(
+                    (a, b) => safeTs(b.createdAtTs ?? b.createdAt) - safeTs(a.createdAtTs ?? a.createdAt)
+                );
+
+                const christmasKeywords = [
+                    "christmas", "xmas", "santa", "noel", "holiday",
+                    "winter", "snow", "new year", "ny", "jingle",
+                ];
+
+                const exclusive = docs.filter((g) => {
+                    const name = String(g.name || "").toLowerCase();
+                    return christmasKeywords.some((k) => name.includes(k));
+                });
+
+                const bestGames = byUpdated.slice(0, 50).map(toClientGame);
+                const newGames = byCreated.slice(0, 50).map(toClientGame);
+
+                const rtp97Games = docs
+                    .filter((g) => typeof g.rtp === "number" && g.rtp >= 97)
+                    .sort((a, b) => (b.rtp ?? 0) - (a.rtp ?? 0))
+                    .slice(0, 50)
+                    .map(toClientGame);
+
+                const exclusiveGames = (exclusive.length ? exclusive : byUpdated)
+                    .slice(0, 50)
+                    .map(toClientGame);
+
+                return [
+                    { id: "exclusive", title: "Exclusive games", icon: "🎁", games: exclusiveGames },
+                    { id: "best", title: "Best games", icon: "⭐", games: bestGames },
+                    { id: "new", title: "New games", icon: "🆕", games: newGames },
+                    { id: "rtp97", title: "RTP 97%", icon: "🎯", games: rtp97Games },
+                ];
+            })()
+                .then((data) => {
+                    homeCache = { ts: Date.now(), data };
+                    return data;
+                })
+                .catch((e) => {
+                    // Open circuit on quota errors to stop 15s hangs/retries
+                    if (isQuotaError(e)) {
+                        homeCircuitUntil = Date.now() + 60 * 1000; // 60s cooldown
+                    }
+                    throw e;
+                })
+                .finally(() => {
+                    homeInFlight = null;
+                });
+        }
+
+        // 4) Timeout so requests don't hang forever
+        const data = await withTimeout(homeInFlight, 2500);
+        res.json(data);
+    } catch (e) {
+        if (isQuotaError(e) && homeCache?.data) {
+            res.json(homeCache.data); // stale fallback
+            return;
+        }
+        res.status(503).json({ error: String(e.message || e) });
     }
 });
+
 
 /* -----------------------------
    GAME: cache per id + stale fallback on quota
