@@ -19,6 +19,9 @@ app.set("trust proxy", true);
 app.use(cors());
 app.use(express.json());
 
+const GEO_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24h
+const geoCache = new Map(); // ip -> { ts, data }
+
 function requireSecret(req) {
     const secret = req.headers["x-sync-secret"];
     return secret && secret === process.env.SYNC_SECRET;
@@ -55,64 +58,106 @@ app.get("/health", (req, res) => {
     res.json({ ok: true });
 });
 
+function cacheGet(ip) {
+    const v = geoCache.get(ip);
+    if (!v) return null;
+    if (Date.now() - v.ts > GEO_CACHE_TTL_MS) {
+        geoCache.delete(ip);
+        return null;
+    }
+    return v.data;
+}
+
+function cacheSet(ip, data) {
+    geoCache.set(ip, { ts: Date.now(), data });
+}
+
+async function fetchJson(url, headers = {}) {
+    const r = await fetch(url, {
+        headers: {
+            "User-Agent": "FreakSlots/1.0",
+            Accept: "application/json",
+            ...headers,
+        },
+    });
+    const text = await r.text().catch(() => "");
+    let json = null;
+    try {
+        json = JSON.parse(text);
+    } catch {
+        // ignore
+    }
+    return { ok: r.ok, status: r.status, json, text };
+}
+
 /**
  * GEO by IP (automatic, no permission prompt).
  * Returns country/city information based on request IP.
  */
 app.get("/api/geo", async (req, res) => {
     try {
-        const ip = normalizeIp(getClientIp(req));
+        const ip = normalizeIp(getClientIp(req)) || "unknown";
 
-        // Use ipapi.co (simple, no extra npm deps needed).
-        // If ip is empty (rare), ipapi will still try to resolve.
-        const url = ip
-            ? `https://ipapi.co/${encodeURIComponent(ip)}/json/`
-            : `https://ipapi.co/json/`;
-
-        const r = await fetch(url, {
-            headers: {
-                // Set a UA to reduce chance of rejection
-                "User-Agent": "FreakSlots/1.0",
-                Accept: "application/json",
-            },
-            // optional: short timeout pattern (node-fetch v3 doesn’t have built-in timeout)
-        });
-
-        if (!r.ok) {
-            const txt = await r.text().catch(() => "");
-            res.status(502).json({
-                ok: false,
-                error: `Geo provider failed (${r.status})`,
-                details: txt.slice(0, 200),
-            });
+        // 1) Cache hit
+        const cached = cacheGet(ip);
+        if (cached) {
+            res.json({ ok: true, cached: true, ...cached });
             return;
         }
 
-        const data = await r.json().catch(() => null);
-        if (!data || typeof data !== "object") {
-            res.status(502).json({ ok: false, error: "Geo provider returned invalid JSON" });
+        // 2) Provider A: ipwho.is (usually lenient, no key)
+        // docs: returns { success, country, city, region, timezone, ip, ... }
+        const a = await fetchJson(`https://ipwho.is/${encodeURIComponent(ip)}`);
+
+        if (a.ok && a.json && a.json.success !== false) {
+            const payload = {
+                ip: a.json.ip || ip,
+                country: a.json.country || null,
+                countryCode: a.json.country_code || null,
+                city: a.json.city || null,
+                region: a.json.region || null,
+                timezone: a.json.timezone?.id || a.json.timezone || null,
+            };
+            payload.label =
+                payload.country && payload.city
+                    ? `${payload.country} (${payload.city})`
+                    : payload.country || payload.city || "Unknown";
+
+            cacheSet(ip, payload);
+            res.json({ ok: true, cached: false, ...payload });
             return;
         }
 
-        // ipapi.co fields: country_name, country_code, city, region, timezone, etc.
-        const country = data.country_name || null;
-        const countryCode = data.country_code || null;
-        const city = data.city || null;
-        const region = data.region || null;
-        const timezone = data.timezone || null;
+        // 3) Fallback provider B: ipapi.co
+        const b = await fetchJson(
+            ip === "unknown" ? "https://ipapi.co/json/" : `https://ipapi.co/${encodeURIComponent(ip)}/json/`
+        );
 
-        const label =
-            country && city ? `${country} (${city})` : country || city || "Unknown";
+        if (b.ok && b.json && typeof b.json === "object" && !b.json.error) {
+            const payload = {
+                ip: b.json.ip || ip,
+                country: b.json.country_name || null,
+                countryCode: b.json.country_code || null,
+                city: b.json.city || null,
+                region: b.json.region || null,
+                timezone: b.json.timezone || null,
+            };
+            payload.label =
+                payload.country && payload.city
+                    ? `${payload.country} (${payload.city})`
+                    : payload.country || payload.city || "Unknown";
 
-        res.json({
-            ok: true,
-            ip: data.ip || ip || null,
-            country,
-            countryCode,
-            city,
-            region,
-            timezone,
-            label,
+            cacheSet(ip, payload);
+            res.json({ ok: true, cached: false, ...payload });
+            return;
+        }
+
+        // If both failed, return meaningful error
+        res.status(502).json({
+            ok: false,
+            error: "Geo providers failed",
+            providerA: { status: a.status, details: a.json || a.text?.slice(0, 200) },
+            providerB: { status: b.status, details: b.json || b.text?.slice(0, 200) },
         });
     } catch (e) {
         res.status(500).json({ ok: false, error: String(e.message || e) });
