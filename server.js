@@ -6,6 +6,7 @@ import { db } from "./firebase.js";
 import { runSync } from "./sync.js";
 import { seedNewestPublishedGames } from "./sync.js";
 import { deleteCollection } from "./admin.js";
+import { initTelegramBot } from "./telegramBot.js";
 
 const app = express();
 
@@ -17,6 +18,7 @@ app.set("trust proxy", true);
 
 app.use(cors());
 app.use(express.json());
+initTelegramBot(app);
 
 /* -----------------------------
    GEO cache (unchanged)
