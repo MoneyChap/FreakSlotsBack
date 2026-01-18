@@ -412,32 +412,64 @@ app.post("/api/admin/best-games/pull", async (req, res) => {
             ? req.body.names
             : DEFAULT_BEST_GAME_NAMES;
 
-        const maxPages = Number(req.body?.maxPages ?? 40);
+        // Scan deeper by default
+        const maxPages = Number(req.body?.maxPages ?? 400);
+
+        // Even if SlotsLaunch caps per_page, keeping this high does not hurt.
         const perPage = Number(req.body?.perPage ?? 150);
 
-        const wanted = names.map((n) => ({ raw: String(n), key: keyName(n) }));
-        const foundByKey = new Map(); // key -> normalized game doc
+        const wanted = names.map((n) => ({
+            raw: String(n),
+            key: keyName(n),
+        }));
+
+        // foundByKey: key -> normalized game doc
+        const foundByKey = new Map();
 
         let page = 1;
+        let lastMeta = null;
 
         while (page <= maxPages && foundByKey.size < wanted.length) {
             const data = await fetchGamesPage({ page, perPage, updatedAt: null });
 
+            // SlotsLaunch usually returns { data: [...], meta: {...} }
             const rawGames = Array.isArray(data) ? data : (data.data || data.games || []);
+            lastMeta = Array.isArray(data) ? null : (data.meta || data.pagination || null);
+
             if (!rawGames.length) break;
 
             for (const g of rawGames) {
                 const apiName = g?.name || g?.title || "";
-                const k = keyName(apiName);
-                const match = wanted.find((w) => w.key === k);
+                const apiKey = keyName(apiName);
 
-                if (match && !foundByKey.has(match.key)) {
-                    const normalized = normalizeGame(g);
-                    if (normalized.published === true) {
-                        foundByKey.set(match.key, normalized);
+                // FUZZY MATCH:
+                // - exact key match OR
+                // - api title contains requested title OR
+                // - requested title contains api title (rare but safe)
+                for (const w of wanted) {
+                    if (foundByKey.has(w.key)) continue;
+
+                    const ok =
+                        apiKey === w.key ||
+                        apiKey.includes(w.key) ||
+                        w.key.includes(apiKey);
+
+                    if (ok) {
+                        const normalized = normalizeGame(g); // uses same shape as your sync 
+                        if (normalized.published === true) {
+                            foundByKey.set(w.key, normalized);
+                        }
                     }
                 }
             }
+
+            // If API provides total pages, we can stop earlier
+            const totalPages =
+                typeof lastMeta?.total_pages === "number" ? lastMeta.total_pages :
+                    typeof lastMeta?.last_page === "number" ? lastMeta.last_page :
+                        null;
+
+            if (totalPages && page >= totalPages) break;
 
             page += 1;
         }
@@ -455,7 +487,6 @@ app.post("/api/admin/best-games/pull", async (req, res) => {
             await upsertGames(found);
             await setPinnedBestIds(found.map((g) => String(g.id)));
 
-            // Drop caches so it shows immediately
             homeCache = null;
             gameCache.clear();
         }
@@ -465,12 +496,14 @@ app.post("/api/admin/best-games/pull", async (req, res) => {
             requested: names,
             found: found.map((g) => ({ id: g.id, name: g.name, provider: g.provider })),
             missing,
-            pagesScanned: page - 1,
+            pagesScanned: page,
+            meta: lastMeta || null,
         });
     } catch (e) {
         res.status(500).json({ error: String(e.message || e) });
     }
 });
+
 
 /* -----------------------------
    ADMIN reset (unchanged)
