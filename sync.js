@@ -15,13 +15,32 @@ function toDateStringYYYYMMDD(d) {
     return `${yyyy}-${mm}-${dd}`;
 }
 
+function resolveProvider(g) {
+    if (!g || typeof g !== "object") return "";
+
+    // Most common: provider is an object
+    if (typeof g.provider === "object" && g.provider?.name) {
+        return String(g.provider.name);
+    }
+
+    // Sometimes provider is already a string
+    if (typeof g.provider === "string") {
+        return g.provider;
+    }
+
+    // Alternative fields used by SlotsLaunch
+    if (typeof g.studio === "string") return g.studio;
+    if (typeof g.studio_name === "string") return g.studio_name;
+    if (typeof g.vendor === "string") return g.vendor;
+    if (typeof g.vendor_name === "string") return g.vendor_name;
+
+    return "";
+}
+
 export function normalizeGame(g) {
     const id = String(g.id);
     const name = g.name || g.title || "";
-    const provider =
-        (g.provider && (g.provider.name || g.provider.title)) ||
-        g.provider_name ||
-        "";
+    const provider = resolveProvider(g);
     const thumb = g.thumb || g.thumbnail || "";
     const rtp = typeof g.rtp === "number" ? g.rtp : g.rtp ? Number(g.rtp) : null;
 
