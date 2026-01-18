@@ -15,7 +15,7 @@ function toDateStringYYYYMMDD(d) {
     return `${yyyy}-${mm}-${dd}`;
 }
 
-function normalizeGame(g) {
+export function normalizeGame(g) {
     const id = String(g.id);
     const name = g.name || g.title || "";
     const provider =
@@ -55,7 +55,7 @@ function normalizeGame(g) {
 }
 
 
-async function upsertGames(games) {
+export async function upsertGames(games) {
     const firestore = db();
     const chunkSize = 250;
 

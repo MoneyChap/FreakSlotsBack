@@ -3,29 +3,22 @@ import express from "express";
 import cors from "cors";
 import fetch from "node-fetch";
 import { db } from "./firebase.js";
-import { runSync } from "./sync.js";
-import { seedNewestPublishedGames } from "./sync.js";
+import { runSync, seedNewestPublishedGames, normalizeGame, upsertGames } from "./sync.js";
 import { deleteCollection } from "./admin.js";
-// import { initTelegramBot } from "./telegramBot.js";
+import { fetchGamesPage } from "./slotslaunch.js";
 
 const app = express();
 
-/**
- * Important for Render / reverse proxies:
- * This makes req.ip use X-Forwarded-For correctly.
- */
 app.set("trust proxy", true);
 
 app.use(cors());
 app.use(express.json());
-// initTelegramBot(app);
 
 /* -----------------------------
    GEO cache (unchanged)
 ------------------------------ */
 const GEO_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24h
 const geoCache = new Map(); // ip -> { ts, data }
-
 
 function requireSecret(req) {
     const secret = req.headers["x-sync-secret"];
@@ -86,7 +79,6 @@ let homeCache = null; // { ts, data }
 let homeInFlight = null; // Promise resolving to result array
 let homeCircuitUntil = 0; // if quota errors happen, skip Firestore until this time
 
-
 const GAME_CACHE_TTL_MS = 10 * 60 * 1000; // 10 min
 const gameCache = new Map(); // id -> { ts, data }
 
@@ -119,6 +111,57 @@ function toClientGame(g) {
     };
 }
 
+/* -----------------------------
+   Best-games pinning (NEW)
+------------------------------ */
+const DEFAULT_BEST_GAME_NAMES = [
+    "Zeus vs Hades gods of war",
+    "wanted dead or a wild",
+    "Sweet bonanza 1000",
+    "Mental 2",
+    "Brute Force",
+];
+
+function keyName(s) {
+    return String(s || "")
+        .toLowerCase()
+        .replace(/&/g, " and ")
+        .replace(/[^a-z0-9]+/g, " ")
+        .trim()
+        .replace(/\s+/g, " ");
+}
+
+async function getPinnedBestIds() {
+    const firestore = db();
+    const snap = await firestore.collection("meta").doc("curation").get();
+    if (!snap.exists) return [];
+    const ids = snap.data()?.bestPinnedIds;
+    return Array.isArray(ids) ? ids.map(String).filter(Boolean) : [];
+}
+
+async function setPinnedBestIds(ids) {
+    const firestore = db();
+    await firestore.collection("meta").doc("curation").set(
+        {
+            bestPinnedIds: ids.map(String),
+            updatedAt: new Date().toISOString(),
+        },
+        { merge: true }
+    );
+}
+
+function mergePinnedFirst(pinnedDocs, poolDocs, limit) {
+    const pinnedIds = new Set(pinnedDocs.map((g) => String(g.id)));
+    const merged = [...pinnedDocs];
+
+    for (const g of poolDocs) {
+        if (merged.length >= limit) break;
+        if (pinnedIds.has(String(g.id))) continue;
+        merged.push(g);
+    }
+
+    return merged.slice(0, limit);
+}
 
 /* -----------------------------
    Debug / health
@@ -206,29 +249,21 @@ app.get("/api/geo", async (req, res) => {
 ------------------------------ */
 app.get("/api/home", async (req, res) => {
     try {
-        // 1) Serve cache if fresh
         if (homeCache && Date.now() - homeCache.ts < HOME_CACHE_TTL_MS) {
             res.json(homeCache.data);
             return;
         }
 
-        // 2) If we recently hit quota, do NOT touch Firestore (fast path)
         if (Date.now() < homeCircuitUntil) {
-            if (homeCache?.data) {
-                res.json(homeCache.data); // stale but usable
-            } else {
-                res.status(503).json({ error: "Temporarily unavailable" });
-            }
+            if (homeCache?.data) res.json(homeCache.data);
+            else res.status(503).json({ error: "Temporarily unavailable" });
             return;
         }
 
-        // 3) Coalesce multiple requests into one Firestore read
         if (!homeInFlight) {
             homeInFlight = (async () => {
                 const firestore = db();
 
-                // Only one query. Keep limit low.
-                // If you added updatedAtTs/createdAtTs later, it will use them for sorting in-memory.
                 const snap = await firestore
                     .collection("games")
                     .where("enabled", "==", true)
@@ -254,7 +289,18 @@ app.get("/api/home", async (req, res) => {
                     return christmasKeywords.some((k) => name.includes(k));
                 });
 
-                const bestGames = byUpdated.slice(0, 50).map(toClientGame);
+                // NEW: pinned best games first
+                const pinnedIds = await getPinnedBestIds();
+                let pinnedDocs = [];
+                if (pinnedIds.length) {
+                    const pinnedSet = new Set(pinnedIds.map(String));
+                    pinnedDocs = docs
+                        .filter((g) => pinnedSet.has(String(g.id)))
+                        .sort((a, b) => pinnedIds.indexOf(String(a.id)) - pinnedIds.indexOf(String(b.id)));
+                }
+
+                const bestMerged = mergePinnedFirst(pinnedDocs, byUpdated, 50).map(toClientGame);
+
                 const newGames = byCreated.slice(0, 50).map(toClientGame);
 
                 const rtp97Games = docs
@@ -269,7 +315,7 @@ app.get("/api/home", async (req, res) => {
 
                 return [
                     { id: "exclusive", title: "Exclusive games", icon: "🎁", games: exclusiveGames },
-                    { id: "best", title: "Best games", icon: "⭐", games: bestGames },
+                    { id: "best", title: "Best games", icon: "⭐", games: bestMerged },
                     { id: "new", title: "New games", icon: "🆕", games: newGames },
                     { id: "rtp97", title: "RTP 97%", icon: "🎯", games: rtp97Games },
                 ];
@@ -279,10 +325,7 @@ app.get("/api/home", async (req, res) => {
                     return data;
                 })
                 .catch((e) => {
-                    // Open circuit on quota errors to stop 15s hangs/retries
-                    if (isQuotaError(e)) {
-                        homeCircuitUntil = Date.now() + 60 * 1000; // 60s cooldown
-                    }
+                    if (isQuotaError(e)) homeCircuitUntil = Date.now() + 60 * 1000;
                     throw e;
                 })
                 .finally(() => {
@@ -290,18 +333,16 @@ app.get("/api/home", async (req, res) => {
                 });
         }
 
-        // 4) Timeout so requests don't hang forever
         const data = await withTimeout(homeInFlight, 2500);
         res.json(data);
     } catch (e) {
         if (isQuotaError(e) && homeCache?.data) {
-            res.json(homeCache.data); // stale fallback
+            res.json(homeCache.data);
             return;
         }
         res.status(503).json({ error: String(e.message || e) });
     }
 });
-
 
 /* -----------------------------
    GAME: cache per id + stale fallback on quota
@@ -309,7 +350,6 @@ app.get("/api/home", async (req, res) => {
 app.get("/api/games/:id", async (req, res) => {
     const id = String(req.params.id);
 
-    // Cache hit
     const cached = gameCache.get(id);
     if (cached && Date.now() - cached.ts < GAME_CACHE_TTL_MS) {
         res.json(cached.data);
@@ -332,7 +372,6 @@ app.get("/api/games/:id", async (req, res) => {
         res.json(payload);
     } catch (e) {
         if (isQuotaError(e) && cached?.data) {
-            // Serve stale to prevent "Game not found" on temporary Firestore throttling
             res.json(cached.data);
             return;
         }
@@ -351,11 +390,83 @@ app.post("/api/sync", async (req, res) => {
         }
 
         const info = await runSync();
-
-        // After syncing, drop home cache so next /api/home rebuilds once
         homeCache = null;
 
         res.json({ ok: true, info });
+    } catch (e) {
+        res.status(500).json({ error: String(e.message || e) });
+    }
+});
+
+/* -----------------------------
+   ADMIN: pull and pin best games from SlotsLaunch (NEW)
+------------------------------ */
+app.post("/api/admin/best-games/pull", async (req, res) => {
+    try {
+        if (!requireSecret(req)) {
+            res.status(401).json({ error: "Unauthorized" });
+            return;
+        }
+
+        const names = Array.isArray(req.body?.names) && req.body.names.length
+            ? req.body.names
+            : DEFAULT_BEST_GAME_NAMES;
+
+        const maxPages = Number(req.body?.maxPages ?? 40);
+        const perPage = Number(req.body?.perPage ?? 150);
+
+        const wanted = names.map((n) => ({ raw: String(n), key: keyName(n) }));
+        const foundByKey = new Map(); // key -> normalized game doc
+
+        let page = 1;
+
+        while (page <= maxPages && foundByKey.size < wanted.length) {
+            const data = await fetchGamesPage({ page, perPage, updatedAt: null });
+
+            const rawGames = Array.isArray(data) ? data : (data.data || data.games || []);
+            if (!rawGames.length) break;
+
+            for (const g of rawGames) {
+                const apiName = g?.name || g?.title || "";
+                const k = keyName(apiName);
+                const match = wanted.find((w) => w.key === k);
+
+                if (match && !foundByKey.has(match.key)) {
+                    const normalized = normalizeGame(g);
+                    if (normalized.published === true) {
+                        foundByKey.set(match.key, normalized);
+                    }
+                }
+            }
+
+            page += 1;
+        }
+
+        const found = [];
+        const missing = [];
+
+        for (const w of wanted) {
+            const g = foundByKey.get(w.key);
+            if (g) found.push(g);
+            else missing.push(w.raw);
+        }
+
+        if (found.length) {
+            await upsertGames(found);
+            await setPinnedBestIds(found.map((g) => String(g.id)));
+
+            // Drop caches so it shows immediately
+            homeCache = null;
+            gameCache.clear();
+        }
+
+        res.json({
+            ok: true,
+            requested: names,
+            found: found.map((g) => ({ id: g.id, name: g.name, provider: g.provider })),
+            missing,
+            pagesScanned: page - 1,
+        });
     } catch (e) {
         res.status(500).json({ error: String(e.message || e) });
     }
@@ -377,7 +488,6 @@ app.post("/api/admin/reset", async (req, res) => {
 
         const info = await seedNewestPublishedGames({ target });
 
-        // After reset, drop caches
         homeCache = null;
         gameCache.clear();
 
