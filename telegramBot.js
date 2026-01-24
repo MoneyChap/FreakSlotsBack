@@ -1,11 +1,17 @@
 // telegramBot.js
 import TelegramBot from "node-telegram-bot-api";
+import util from "node:util";
 import { db } from "./firebase.js";
 
 function requireEnv(name) {
     const v = process.env[name];
     if (!v) throw new Error(`Missing env: ${name}`);
     return v;
+}
+
+function normalizeBaseUrl(url) {
+    // remove trailing slashes to avoid // in webhook URL
+    return String(url || "").replace(/\/+$/, "");
 }
 
 const ADMIN_USER_IDS = (process.env.TG_ADMIN_IDS || "")
@@ -22,7 +28,11 @@ function isAdmin(userId) {
 async function addUser(userId, username) {
     const firestore = db();
     await firestore.collection("users").doc(String(userId)).set(
-        { id: Number(userId), username: username || "", updatedAt: new Date().toISOString() },
+        {
+            id: Number(userId),
+            username: username || "",
+            updatedAt: new Date().toISOString(),
+        },
         { merge: true }
     );
 }
@@ -33,53 +43,90 @@ async function getAllUsers() {
     return snap.docs.map((d) => d.data()?.id).filter(Boolean);
 }
 
+function logFullError(prefix, err) {
+    console.error(prefix, err?.message || err);
+    if (err?.stack) console.error(err.stack);
+    console.error("full error:", util.inspect(err, { depth: 8 }));
+    const body = err?.response?.body || err?.response?.data;
+    if (body) console.error("telegram response body:", util.inspect(body, { depth: 8 }));
+}
+
+/**
+ * Call this from server.js:
+ *   import { initTelegramBot } from "./telegramBot.js";
+ *   ...
+ *   app.use(express.json());
+ *   initTelegramBot(app);
+ */
 export function initTelegramBot(app) {
     const token = requireEnv("TELEGRAM_BOT_TOKEN");
-    const publicUrl = requireEnv("PUBLIC_BASE_URL"); // e.g. https://your-render-service.onrender.com
-    const webhookSecret = requireEnv("TELEGRAM_WEBHOOK_SECRET"); // any long random string
+    const publicBaseUrl = normalizeBaseUrl(requireEnv("PUBLIC_BASE_URL"));
+    const webhookSecret = requireEnv("TELEGRAM_WEBHOOK_SECRET");
+    const webAppUrl = requireEnv("TG_WEBAPP_URL"); // required for /start button
 
     const bot = new TelegramBot(token, { polling: false });
 
+    bot.on("error", (err) => logFullError("telegram bot error:", err));
+    bot.on("webhook_error", (err) => logFullError("telegram webhook_error:", err));
+
     // Webhook endpoint Telegram will POST updates to
     app.post(`/telegram/webhook/${webhookSecret}`, (req, res) => {
-        console.log("Telegram update received");
-        bot.processUpdate(req.body);
-        res.sendStatus(200);
-    });
-
-    // Register webhook with Telegram
-    bot.setWebHook(`${publicUrl}/telegram/webhook/${webhookSecret}`)
-        .then(() => console.log("Telegram webhook set"))
-        .catch((e) => console.error("Failed to set Telegram webhook:", e));
-
-    // Temporary in-memory store (resets on deploy/restart)
-    const broadcastData = {};
-
-    bot.onText(/\/start/, async (msg) => {
-        const chatId = msg.chat.id;
-        const username = msg.from?.username || "";
-
-        await addUser(chatId, username);
-
-        // Prefer a hosted image URL (local files are awkward on Render)
-        const imageUrl = process.env.TG_WELCOME_IMAGE_URL; // optional
-        const webAppUrl = requireEnv("TG_WEBAPP_URL"); // your mini-app URL
-
-        const caption =
-            'Welcome to FreakSlots\nTo start the mini-app, press the button below 👇';
-
-        const reply_markup = {
-            inline_keyboard: [[{ text: "Open app", web_app: { url: webAppUrl } }]],
-        };
-
-        if (imageUrl) {
-            await bot.sendPhoto(chatId, imageUrl, { caption, reply_markup });
-        } else {
-            await bot.sendMessage(chatId, caption, { reply_markup });
+        try {
+            // If you do not see this line when sending /start, Telegram is not reaching your backend
+            console.log("Telegram update received:", JSON.stringify(req.body));
+            bot.processUpdate(req.body);
+            res.sendStatus(200);
+        } catch (err) {
+            logFullError("processUpdate failed:", err);
+            // Still return 200 so Telegram does not retry aggressively
+            res.sendStatus(200);
         }
     });
 
-    bot.onText(/\/broadcast$/, async (msg) => {
+    // Register webhook with Telegram
+    const webhookUrl = `${publicBaseUrl}/telegram/webhook/${webhookSecret}`;
+    bot
+        .setWebHook(webhookUrl)
+        .then(() => console.log("Telegram webhook set to:", webhookUrl))
+        .catch((err) => logFullError("Failed to set Telegram webhook:", err));
+
+    // Temporary in-memory store (resets on deploy/restart)
+    const broadcastState = new Map(); // adminChatId -> { step, payload }
+
+    // /start
+    bot.onText(/^\/start(?:\s|$)/, async (msg) => {
+        const chatId = msg.chat.id;
+        const username = msg.from?.username || "";
+
+        try {
+            await addUser(chatId, username);
+
+            const imageUrl = process.env.TG_WELCOME_IMAGE_URL; // optional
+
+            const caption = "Welcome to FreakSlots.\nTo start the mini-app, press the button below.";
+
+            const reply_markup = {
+                inline_keyboard: [[{ text: "Open app", web_app: { url: webAppUrl } }]],
+            };
+
+            if (imageUrl) {
+                await bot.sendPhoto(chatId, imageUrl, { caption, reply_markup });
+            } else {
+                await bot.sendMessage(chatId, caption, { reply_markup });
+            }
+        } catch (err) {
+            logFullError("start handler failed:", err);
+            // Try to send something even if DB fails
+            try {
+                await bot.sendMessage(chatId, "An error occurred. Please try again later.");
+            } catch (e2) {
+                logFullError("failed to send fallback message:", e2);
+            }
+        }
+    });
+
+    // /broadcast (admin only)
+    bot.onText(/^\/broadcast(?:\s|$)/, async (msg) => {
         const chatId = msg.chat.id;
 
         if (!isAdmin(chatId)) {
@@ -87,81 +134,110 @@ export function initTelegramBot(app) {
             return;
         }
 
-        broadcastData[chatId] = { step: "waiting_for_message" };
-        await bot.sendMessage(chatId, "Send me the message you wish to broadcast.");
+        broadcastState.set(chatId, { step: "waiting_for_message" });
+        await bot.sendMessage(chatId, "Send the message you want to broadcast (text, photo, video, document, audio).");
     });
 
+    // Capture the next message from admin as the broadcast payload
     bot.on("message", async (msg) => {
         const chatId = msg.chat.id;
 
         if (!isAdmin(chatId)) return;
 
-        const state = broadcastData[chatId];
+        const state = broadcastState.get(chatId);
         if (!state || state.step !== "waiting_for_message") return;
 
-        broadcastData[chatId] = { step: "confirming", message: msg };
+        // Ignore commands as broadcast content
+        if (typeof msg.text === "string" && msg.text.startsWith("/")) return;
 
-        // Echo back for confirmation
-        if (msg.text) await bot.sendMessage(chatId, msg.text, { reply_markup: msg.reply_markup });
-        else if (msg.photo) await bot.sendPhoto(chatId, msg.photo[0].file_id, { caption: msg.caption, reply_markup: msg.reply_markup });
-        else if (msg.video) await bot.sendVideo(chatId, msg.video.file_id, { caption: msg.caption, reply_markup: msg.reply_markup });
-        else if (msg.video_note) await bot.sendVideoNote(chatId, msg.video_note.file_id, { reply_markup: msg.reply_markup });
-        else if (msg.document) await bot.sendDocument(chatId, msg.document.file_id, { caption: msg.caption, reply_markup: msg.reply_markup });
-        else if (msg.audio) await bot.sendAudio(chatId, msg.audio.file_id, { caption: msg.caption, reply_markup: msg.reply_markup });
+        // Store only what we can reliably resend
+        const payload = {
+            text: msg.text || null,
+            caption: msg.caption || null,
+            photoFileId: msg.photo?.length ? msg.photo[msg.photo.length - 1].file_id : null,
+            videoFileId: msg.video?.file_id || null,
+            videoNoteFileId: msg.video_note?.file_id || null,
+            documentFileId: msg.document?.file_id || null,
+            audioFileId: msg.audio?.file_id || null,
+        };
 
-        await bot.sendMessage(chatId, "Is this the message you want to broadcast?", {
-            reply_markup: {
-                inline_keyboard: [
-                    [{ text: "Approve✅", callback_data: "approve_broadcast" }],
-                    [{ text: "Decline❌", callback_data: "decline_broadcast" }],
-                ],
-            },
-        });
+        broadcastState.set(chatId, { step: "confirming", payload });
+
+        // Echo back for confirmation (without reply_markup, because it is not present on incoming messages)
+        try {
+            if (payload.text) await bot.sendMessage(chatId, payload.text);
+            else if (payload.photoFileId) await bot.sendPhoto(chatId, payload.photoFileId, { caption: payload.caption || "" });
+            else if (payload.videoFileId) await bot.sendVideo(chatId, payload.videoFileId, { caption: payload.caption || "" });
+            else if (payload.videoNoteFileId) await bot.sendVideoNote(chatId, payload.videoNoteFileId);
+            else if (payload.documentFileId) await bot.sendDocument(chatId, payload.documentFileId, { caption: payload.caption || "" });
+            else if (payload.audioFileId) await bot.sendAudio(chatId, payload.audioFileId, { caption: payload.caption || "" });
+            else {
+                await bot.sendMessage(chatId, "Unsupported message type. Please send text, photo, video, document, or audio.");
+                broadcastState.delete(chatId);
+                return;
+            }
+
+            await bot.sendMessage(chatId, "Is this the message you want to broadcast?", {
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ text: "Approve✅", callback_data: "approve_broadcast" }],
+                        [{ text: "Decline❌", callback_data: "decline_broadcast" }],
+                    ],
+                },
+            });
+        } catch (err) {
+            logFullError("broadcast confirm failed:", err);
+            broadcastState.delete(chatId);
+        }
     });
 
+    // Approve/decline broadcast
     bot.on("callback_query", async (callbackQuery) => {
         const chatId = callbackQuery.message?.chat?.id;
         const data = callbackQuery.data;
 
         if (!chatId || !isAdmin(chatId)) return;
 
-        const state = broadcastData[chatId];
+        const state = broadcastState.get(chatId);
         if (!state || state.step !== "confirming") return;
 
         if (data === "decline_broadcast") {
-            delete broadcastData[chatId];
+            broadcastState.delete(chatId);
             await bot.sendMessage(chatId, "Broadcast cancelled. Send /broadcast to start again.");
             return;
         }
 
         if (data !== "approve_broadcast") return;
 
-        const messageToBroadcast = state.message;
-        delete broadcastData[chatId];
+        const payload = state.payload;
+        broadcastState.delete(chatId);
 
-        const userIds = await getAllUsers();
+        let userIds = [];
+        try {
+            userIds = await getAllUsers();
+        } catch (err) {
+            logFullError("getAllUsers failed:", err);
+            await bot.sendMessage(chatId, "Failed to load users from the database.");
+            return;
+        }
+
+        let sent = 0;
 
         for (const userId of userIds) {
             try {
-                if (messageToBroadcast.text) {
-                    await bot.sendMessage(userId, messageToBroadcast.text, { reply_markup: messageToBroadcast.reply_markup });
-                } else if (messageToBroadcast.photo) {
-                    await bot.sendPhoto(userId, messageToBroadcast.photo[0].file_id, { caption: messageToBroadcast.caption, reply_markup: messageToBroadcast.reply_markup });
-                } else if (messageToBroadcast.video) {
-                    await bot.sendVideo(userId, messageToBroadcast.video.file_id, { caption: messageToBroadcast.caption, reply_markup: messageToBroadcast.reply_markup });
-                } else if (messageToBroadcast.video_note) {
-                    await bot.sendVideoNote(userId, messageToBroadcast.video_note.file_id, { reply_markup: messageToBroadcast.reply_markup });
-                } else if (messageToBroadcast.document) {
-                    await bot.sendDocument(userId, messageToBroadcast.document.file_id, { caption: messageToBroadcast.caption, reply_markup: messageToBroadcast.reply_markup });
-                } else if (messageToBroadcast.audio) {
-                    await bot.sendAudio(userId, messageToBroadcast.audio.file_id, { caption: messageToBroadcast.caption, reply_markup: messageToBroadcast.reply_markup });
-                }
+                if (payload.text) await bot.sendMessage(userId, payload.text);
+                else if (payload.photoFileId) await bot.sendPhoto(userId, payload.photoFileId, { caption: payload.caption || "" });
+                else if (payload.videoFileId) await bot.sendVideo(userId, payload.videoFileId, { caption: payload.caption || "" });
+                else if (payload.videoNoteFileId) await bot.sendVideoNote(userId, payload.videoNoteFileId);
+                else if (payload.documentFileId) await bot.sendDocument(userId, payload.documentFileId, { caption: payload.caption || "" });
+                else if (payload.audioFileId) await bot.sendAudio(userId, payload.audioFileId, { caption: payload.caption || "" });
+                sent += 1;
             } catch {
                 // ignore blocked users, etc.
             }
         }
 
-        await bot.sendMessage(chatId, "Message successfully broadcasted to all users.");
+        await bot.sendMessage(chatId, `Broadcast completed. Delivered to ${sent} users.`);
     });
 
     return bot;
