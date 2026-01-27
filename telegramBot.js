@@ -118,7 +118,7 @@ export function initTelegramBot(app) {
 
             const imageUrl = process.env.TG_WELCOME_IMAGE_URL; // optional
 
-            const caption = "Welcome to FreakSlots.\nTo start the mini-app, press the button below.";
+            const caption = "👋 Welcome, " + `${username}` + "!\n🎰 Wanna spin without risk?\n\nPlay free demo slots only inside this bot\n\n🏆 Top-rated games & working providers always available\n\n💎 Hidden bonuses & special offers unlocked for players\n\n🔥 Best slots updated daily — don’t miss hot games\n\n👇 Hit play now & start spinning";
 
             const reply_markup = {
                 inline_keyboard: [[{ text: "Open app", web_app: { url: webAppUrl } }]],
