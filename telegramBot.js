@@ -121,7 +121,7 @@ export function initTelegramBot(app) {
             const caption = "👋 Welcome, " + `${username}` + "!\n\n🎰 Wanna spin without risk?\nPlay free demo slots only inside this bot\n\n🏆 Top-rated games & working providers always available\n\n💎 Hidden bonuses & special offers unlocked for players\n\n🔥 Best slots updated daily — don’t miss hot games\n\n👇 Hit play now & start spinning";
 
             const reply_markup = {
-                inline_keyboard: [[{ text: "Open app", web_app: { url: webAppUrl } }]],
+                inline_keyboard: [[{ text: "Play Now", web_app: { url: webAppUrl } }]],
             };
 
             try {
