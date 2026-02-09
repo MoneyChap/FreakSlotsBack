@@ -190,7 +190,7 @@ export function initTelegramBot(app) {
             if (payload.text) await bot.sendMessage(chatId, payload.text, {
                 entities: payload.textEntities || undefined,
             });
-            else if (payload.photoFileId) await bot.sendPhoto(userId, payload.photoFileId, {
+            else if (payload.photoFileId) await bot.sendPhoto(chatId, payload.photoFileId, {
                 caption: payload.caption || "",
                 caption_entities: payload.captionEntities || undefined,
             });
