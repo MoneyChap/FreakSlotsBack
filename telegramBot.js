@@ -257,7 +257,9 @@ export function initTelegramBot(app) {
                 });
                 else if (payload.photoFileId) await bot.sendPhoto(userId, payload.photoFileId, {
                     caption: payload.caption || "",
-                    caption_entities: payload.captionEntities || undefined,
+                    caption_entities: payload.captionEntities
+                        ? JSON.stringify(payload.captionEntities)
+                        : undefined,
                 });
                 else if (payload.videoFileId) await bot.sendVideo(userId, payload.videoFileId, { caption: payload.caption || "" });
                 else if (payload.videoNoteFileId) await bot.sendVideoNote(userId, payload.videoNoteFileId);
