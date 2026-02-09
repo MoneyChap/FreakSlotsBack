@@ -283,13 +283,12 @@ app.get("/api/home", async (req, res) => {
                     (a, b) => safeTs(b.createdAtTs ?? b.createdAt) - safeTs(a.createdAtTs ?? a.createdAt)
                 );
 
-                const valentineKeywords = [
-                    "valentine", "valentines", "love", "romance", "heart", "hearts", "cupid",
-                ];
+                const valentineRegex = /\b(valentine'?s?|romance|romantic|cupid|heart|hearts|kiss|lover|lovers)\b/i;
+                const excludedRegex = /\b(leprechaun|clover|st\.?\s*patrick|shamrock|irish)\b/i;
 
                 const exclusive = docs.filter((g) => {
-                    const name = String(g.name || "").toLowerCase();
-                    return valentineKeywords.some((k) => name.includes(k));
+                    const name = String(g.name || "");
+                    return valentineRegex.test(name) && !excludedRegex.test(name);
                 });
 
                 // NEW: pinned best games first
@@ -313,9 +312,7 @@ app.get("/api/home", async (req, res) => {
                     .map(toClientGame);
 
 
-                const exclusiveGames = exclusive
-                    .slice(0, 5)
-                    .map(toClientGame);
+                const exclusiveGames = exclusive.map(toClientGame);
 
                 return [
                     { id: "exclusive", title: "Exclusive games", icon: "🎁", games: exclusiveGames },
@@ -611,5 +608,4 @@ const port = Number(process.env.PORT || 3001);
 app.listen(port, () => {
     console.log(`API listening on :${port}`);
 });
-
 
