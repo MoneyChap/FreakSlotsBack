@@ -283,14 +283,13 @@ app.get("/api/home", async (req, res) => {
                     (a, b) => safeTs(b.createdAtTs ?? b.createdAt) - safeTs(a.createdAtTs ?? a.createdAt)
                 );
 
-                const christmasKeywords = [
-                    "christmas", "xmas", "santa", "noel", "holiday",
-                    "winter", "snow", "new year", "ny", "jingle",
+                const valentineKeywords = [
+                    "valentine", "valentines", "love", "romance", "heart", "hearts", "cupid",
                 ];
 
                 const exclusive = docs.filter((g) => {
                     const name = String(g.name || "").toLowerCase();
-                    return christmasKeywords.some((k) => name.includes(k));
+                    return valentineKeywords.some((k) => name.includes(k));
                 });
 
                 // NEW: pinned best games first
