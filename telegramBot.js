@@ -173,7 +173,9 @@ export function initTelegramBot(app) {
         // Store only what we can reliably resend
         const payload = {
             text: msg.text || null,
+            textEntities: Array.isArray(msg.entities) ? msg.entities : null,
             caption: msg.caption || null,
+            captionEntities: Array.isArray(msg.caption_entities) ? msg.caption_entities : null,
             photoFileId: msg.photo?.length ? msg.photo[msg.photo.length - 1].file_id : null,
             videoFileId: msg.video?.file_id || null,
             videoNoteFileId: msg.video_note?.file_id || null,
@@ -185,8 +187,13 @@ export function initTelegramBot(app) {
 
         // Echo back for confirmation (without reply_markup, because it is not present on incoming messages)
         try {
-            if (payload.text) await bot.sendMessage(chatId, payload.text);
-            else if (payload.photoFileId) await bot.sendPhoto(chatId, payload.photoFileId, { caption: payload.caption || "" });
+            if (payload.text) await bot.sendMessage(chatId, payload.text, {
+                entities: payload.textEntities || undefined,
+            });
+            else if (payload.photoFileId) await bot.sendPhoto(userId, payload.photoFileId, {
+                caption: payload.caption || "",
+                caption_entities: payload.captionEntities || undefined,
+            });
             else if (payload.videoFileId) await bot.sendVideo(chatId, payload.videoFileId, { caption: payload.caption || "" });
             else if (payload.videoNoteFileId) await bot.sendVideoNote(chatId, payload.videoNoteFileId);
             else if (payload.documentFileId) await bot.sendDocument(chatId, payload.documentFileId, { caption: payload.caption || "" });
@@ -245,8 +252,13 @@ export function initTelegramBot(app) {
 
         for (const userId of userIds) {
             try {
-                if (payload.text) await bot.sendMessage(userId, payload.text);
-                else if (payload.photoFileId) await bot.sendPhoto(userId, payload.photoFileId, { caption: payload.caption || "" });
+                if (payload.text) await bot.sendMessage(userId, payload.text, {
+                    entities: payload.textEntities || undefined,
+                });
+                else if (payload.photoFileId) await bot.sendPhoto(userId, payload.photoFileId, {
+                    caption: payload.caption || "",
+                    caption_entities: payload.captionEntities || undefined,
+                });
                 else if (payload.videoFileId) await bot.sendVideo(userId, payload.videoFileId, { caption: payload.caption || "" });
                 else if (payload.videoNoteFileId) await bot.sendVideoNote(userId, payload.videoNoteFileId);
                 else if (payload.documentFileId) await bot.sendDocument(userId, payload.documentFileId, { caption: payload.caption || "" });
