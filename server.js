@@ -268,7 +268,7 @@ app.get("/api/home", async (req, res) => {
             homeInFlight = (async () => {
                 const firestore = db();
 
-                const [snap, exclusiveSnap] = await Promise.all([
+                const [snap, exclusiveSnap, rtpSnap] = await Promise.all([
                     firestore
                         .collection("games")
                         .where("enabled", "==", true)
@@ -279,10 +279,16 @@ app.get("/api/home", async (req, res) => {
                         .where("enabled", "==", true)
                         .limit(5000)
                         .get(),
+                    firestore
+                        .collection("games")
+                        .where("enabled", "==", true)
+                        .limit(5000)
+                        .get(),
                 ]);
 
                 const docs = snap.docs.map((d) => d.data());
                 const exclusivePool = exclusiveSnap.docs.map((d) => d.data());
+                const rtpPool = rtpSnap.docs.map((d) => d.data());
 
                 const byUpdated = [...docs].sort(
                     (a, b) => safeTs(b.updatedAtTs ?? b.updatedAt) - safeTs(a.updatedAtTs ?? a.updatedAt)
@@ -315,7 +321,7 @@ app.get("/api/home", async (req, res) => {
 
                 const newGames = byCreated.slice(0, 50).map(toClientGame);
 
-                const rtp97Games = docs
+                const rtp97Games = rtpPool
                     .filter((g) => Number.isFinite(g.rtp) && g.rtp >= 97)
                     .sort((a, b) => (b.rtp ?? 0) - (a.rtp ?? 0))
                     .slice(0, 50)
