@@ -172,6 +172,8 @@ export function initTelegramBot(app) {
 
         // Store only what we can reliably resend
         const payload = {
+            sourceChatId: chatId,
+            sourceMessageId: msg.message_id,
             text: msg.text || null,
             textEntities: Array.isArray(msg.entities) ? msg.entities : null,
             caption: msg.caption || null,
@@ -187,12 +189,16 @@ export function initTelegramBot(app) {
 
         // Echo back for confirmation (without reply_markup, because it is not present on incoming messages)
         try {
-            if (payload.text) await bot.sendMessage(chatId, payload.text, {
+            if (payload.sourceChatId && payload.sourceMessageId) {
+                await bot.copyMessage(chatId, payload.sourceChatId, payload.sourceMessageId);
+            } else if (payload.text) await bot.sendMessage(chatId, payload.text, {
                 entities: payload.textEntities || undefined,
             });
             else if (payload.photoFileId) await bot.sendPhoto(chatId, payload.photoFileId, {
                 caption: payload.caption || "",
-                caption_entities: payload.captionEntities || undefined,
+                caption_entities: payload.captionEntities
+                    ? JSON.stringify(payload.captionEntities)
+                    : undefined,
             });
             else if (payload.videoFileId) await bot.sendVideo(chatId, payload.videoFileId, { caption: payload.caption || "" });
             else if (payload.videoNoteFileId) await bot.sendVideoNote(chatId, payload.videoNoteFileId);
@@ -252,7 +258,9 @@ export function initTelegramBot(app) {
 
         for (const userId of userIds) {
             try {
-                if (payload.text) await bot.sendMessage(userId, payload.text, {
+                if (payload.sourceChatId && payload.sourceMessageId) {
+                    await bot.copyMessage(userId, payload.sourceChatId, payload.sourceMessageId);
+                } else if (payload.text) await bot.sendMessage(userId, payload.text, {
                     entities: payload.textEntities || undefined,
                 });
                 else if (payload.photoFileId) await bot.sendPhoto(userId, payload.photoFileId, {
