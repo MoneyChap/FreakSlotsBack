@@ -268,13 +268,21 @@ app.get("/api/home", async (req, res) => {
             homeInFlight = (async () => {
                 const firestore = db();
 
-                const snap = await firestore
-                    .collection("games")
-                    .where("enabled", "==", true)
-                    .limit(220)
-                    .get();
+                const [snap, exclusiveSnap] = await Promise.all([
+                    firestore
+                        .collection("games")
+                        .where("enabled", "==", true)
+                        .limit(220)
+                        .get(),
+                    firestore
+                        .collection("games")
+                        .where("enabled", "==", true)
+                        .limit(5000)
+                        .get(),
+                ]);
 
                 const docs = snap.docs.map((d) => d.data());
+                const exclusivePool = exclusiveSnap.docs.map((d) => d.data());
 
                 const byUpdated = [...docs].sort(
                     (a, b) => safeTs(b.updatedAtTs ?? b.updatedAt) - safeTs(a.updatedAtTs ?? a.updatedAt)
@@ -286,10 +294,12 @@ app.get("/api/home", async (req, res) => {
                 const valentineRegex = /\b(valentine'?s?|romance|romantic|cupid|heart|hearts|kiss|lover|lovers|love|lovely|amour)\b/i;
                 const excludedRegex = /\b(leprechaun|clover|st\.?\s*patrick|shamrock|irish)\b/i;
 
-                const exclusive = docs.filter((g) => {
+                const exclusive = exclusivePool.filter((g) => {
                     const name = String(g.name || "");
                     return valentineRegex.test(name) && !excludedRegex.test(name);
-                });
+                }).sort(
+                    (a, b) => safeTs(b.updatedAtTs ?? b.updatedAt) - safeTs(a.updatedAtTs ?? a.updatedAt)
+                );
 
                 // NEW: pinned best games first
                 const pinnedIds = await getPinnedBestIds();
