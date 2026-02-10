@@ -125,6 +125,17 @@ const DEFAULT_BEST_GAME_NAMES = [
     "Mental 2",
     "Brute Force",
 ];
+const DEFAULT_CASUAL_GAMES = [
+    { name: "Plinko", provider: "BGaming" },
+    { name: "Aviator", provider: "Spribe" },
+    { name: "Chicken Road", provider: "InOut" },
+    { name: "Chicken Road 2", provider: "InOut" },
+    { name: "Thimbles", provider: "Evoplay" },
+    { name: "Squid Gamebler", provider: "InOut" },
+    { name: "Balloon", provider: "SmartSoft Gaming" },
+    { name: "Mines", provider: "Hacksaw Gaming" },
+    { name: "Aviamasters", provider: "BGaming" },
+];
 
 function keyName(s) {
     return String(s || "")
@@ -148,6 +159,25 @@ async function setPinnedBestIds(ids) {
     await firestore.collection("meta").doc("curation").set(
         {
             bestPinnedIds: ids.map(String),
+            updatedAt: new Date().toISOString(),
+        },
+        { merge: true }
+    );
+}
+
+async function getPinnedCasualIds() {
+    const firestore = db();
+    const snap = await firestore.collection("meta").doc("curation").get();
+    if (!snap.exists) return [];
+    const ids = snap.data()?.casualPinnedIds;
+    return Array.isArray(ids) ? ids.map(String).filter(Boolean) : [];
+}
+
+async function setPinnedCasualIds(ids) {
+    const firestore = db();
+    await firestore.collection("meta").doc("curation").set(
+        {
+            casualPinnedIds: ids.map(String),
             updatedAt: new Date().toISOString(),
         },
         { merge: true }
@@ -320,7 +350,20 @@ app.get("/api/home", async (req, res) => {
                         .sort((a, b) => pinnedIds.indexOf(String(a.id)) - pinnedIds.indexOf(String(b.id)));
                 }
 
+                const casualPinnedIds = await getPinnedCasualIds();
+                let casualPinnedDocs = [];
+                if (casualPinnedIds.length) {
+                    const refs = casualPinnedIds.map((id) => firestore.collection("games").doc(String(id)));
+                    const snaps = await firestore.getAll(...refs);
+                    casualPinnedDocs = snaps
+                        .filter((s) => s.exists)
+                        .map((s) => s.data())
+                        .filter((g) => g?.enabled === true)
+                        .sort((a, b) => casualPinnedIds.indexOf(String(a.id)) - casualPinnedIds.indexOf(String(b.id)));
+                }
+
                 const bestMerged = mergePinnedFirst(pinnedDocs, byUpdated, 50).map(toClientGame);
+                const casualGames = casualPinnedDocs.map(toClientGame);
 
                 const newGames = byCreated.slice(0, 50).map(toClientGame);
 
@@ -336,6 +379,7 @@ app.get("/api/home", async (req, res) => {
                 return [
                     { id: "exclusive", title: "Exclusive games", icon: "🎁", games: exclusiveGames },
                     { id: "best", title: "Best games", icon: "⭐", games: bestMerged },
+                    { id: "casual", title: "Casual games", icon: "🎮", games: casualGames },
                     { id: "new", title: "New games", icon: "🆕", games: newGames },
                     { id: "rtp97", title: "RTP 96%", icon: "🎯", games: rtp97Games },
                 ];
@@ -553,6 +597,150 @@ app.post("/api/admin/best-games/pin", async (req, res) => {
             .map((s) => s.id);
 
         await setPinnedBestIds(existing);
+
+        homeCache = null;
+        gameCache.clear();
+
+        res.json({ ok: true, pinned: existing, missing: ids.filter((id) => !existing.includes(id)) });
+    } catch (e) {
+        res.status(500).json({ error: String(e.message || e) });
+    }
+});
+
+app.post("/api/admin/casual-games/pull", async (req, res) => {
+    try {
+        if (!requireSecret(req)) {
+            res.status(401).json({ error: "Unauthorized" });
+            return;
+        }
+
+        const requestedGames = Array.isArray(req.body?.games) && req.body.games.length
+            ? req.body.games
+            : DEFAULT_CASUAL_GAMES;
+
+        const maxPages = Number(req.body?.maxPages ?? 400);
+        const perPage = Number(req.body?.perPage ?? 150);
+
+        const wanted = requestedGames.map((x, idx) => {
+            const name = String(x?.name || "");
+            const provider = String(x?.provider || "");
+            return {
+                idx,
+                rawName: name,
+                rawProvider: provider,
+                nameKey: keyName(name),
+                providerKey: keyName(provider),
+            };
+        }).filter((x) => x.nameKey);
+
+        const foundByIdx = new Map(); // idx -> normalized game
+
+        let page = 1;
+        let lastMeta = null;
+
+        while (page <= maxPages && foundByIdx.size < wanted.length) {
+            const data = await fetchGamesPage({ page, perPage, updatedAt: null });
+            const rawGames = Array.isArray(data) ? data : (data.data || data.games || []);
+            lastMeta = Array.isArray(data) ? null : (data.meta || data.pagination || null);
+
+            if (!rawGames.length) break;
+
+            for (const g of rawGames) {
+                const normalized = normalizeGame(g);
+                if (normalized.published !== true) continue;
+
+                const apiNameKey = keyName(normalized.name || g?.name || g?.title || "");
+                const apiProviderKey = keyName(normalized.provider || g?.provider?.name || g?.provider || "");
+                const apiTokens = apiNameKey.split(" ").filter(Boolean);
+
+                for (const w of wanted) {
+                    if (foundByIdx.has(w.idx)) continue;
+
+                    const wantTokens = w.nameKey.split(" ").filter(Boolean);
+                    const overlap = wantTokens.filter((t) => apiTokens.includes(t)).length;
+                    const tokenRatio = wantTokens.length ? overlap / wantTokens.length : 0;
+
+                    const nameOk =
+                        apiNameKey === w.nameKey ||
+                        (w.nameKey.length >= 6 && apiNameKey.includes(w.nameKey)) ||
+                        (overlap >= 1 && tokenRatio >= 0.7);
+
+                    const providerOk =
+                        !w.providerKey ||
+                        apiProviderKey === w.providerKey ||
+                        apiProviderKey.includes(w.providerKey) ||
+                        w.providerKey.includes(apiProviderKey);
+
+                    if (nameOk && providerOk) {
+                        foundByIdx.set(w.idx, normalized);
+                    }
+                }
+            }
+
+            const totalPages =
+                typeof lastMeta?.total_pages === "number" ? lastMeta.total_pages :
+                    typeof lastMeta?.last_page === "number" ? lastMeta.last_page :
+                        null;
+
+            if (totalPages && page >= totalPages) break;
+            page += 1;
+        }
+
+        const found = [];
+        const missing = [];
+
+        for (const w of wanted) {
+            const g = foundByIdx.get(w.idx);
+            if (g) found.push(g);
+            else missing.push({ name: w.rawName, provider: w.rawProvider });
+        }
+
+        if (found.length) {
+            await upsertGames(found);
+            await setPinnedCasualIds(found.map((g) => String(g.id)));
+
+            homeCache = null;
+            gameCache.clear();
+        }
+
+        res.json({
+            ok: true,
+            requested: requestedGames,
+            found: found.map((g) => ({ id: g.id, name: g.name, provider: g.provider })),
+            missing,
+            pagesScanned: page,
+            meta: lastMeta || null,
+        });
+    } catch (e) {
+        res.status(500).json({ error: String(e.message || e) });
+    }
+});
+
+app.post("/api/admin/casual-games/pin", async (req, res) => {
+    try {
+        if (!requireSecret(req)) {
+            res.status(401).json({ error: "Unauthorized" });
+            return;
+        }
+
+        const ids = Array.isArray(req.body?.ids)
+            ? req.body.ids.map((x) => String(x).trim()).filter(Boolean)
+            : [];
+
+        if (!ids.length) {
+            res.status(400).json({ error: "ids[] is required" });
+            return;
+        }
+
+        const firestore = db();
+        const refs = ids.map((id) => firestore.collection("games").doc(String(id)));
+        const snaps = await firestore.getAll(...refs);
+
+        const existing = snaps
+            .filter((s) => s.exists)
+            .map((s) => s.id);
+
+        await setPinnedCasualIds(existing);
 
         homeCache = null;
         gameCache.clear();
