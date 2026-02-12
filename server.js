@@ -422,7 +422,25 @@ app.get("/api/games/:id", async (req, res) => {
 
     try {
         const firestore = db();
-        const snap = await firestore.collection("games").doc(id).get();
+        let snap = await firestore.collection("games").doc(id).get();
+
+        // Fallback: if game doc is missing locally, try pulling exact id from SlotsLaunch
+        // and cache it in Firestore to avoid repeated misses.
+        if (!snap.exists) {
+            try {
+                const fetched = await fetchGamesPage({ ids: [id], perPage: 1 });
+                const rawGames = Array.isArray(fetched) ? fetched : (fetched.data || fetched.games || []);
+                if (rawGames.length) {
+                    const normalized = normalizeGame(rawGames[0]);
+                    if (normalized.published === true) {
+                        await upsertGames([normalized]);
+                        snap = await firestore.collection("games").doc(id).get();
+                    }
+                }
+            } catch {
+                // keep original behavior below if upstream fetch fails
+            }
+        }
 
         if (!snap.exists) {
             res.status(404).json({ error: "Not found" });
